@@ -1,7 +1,8 @@
 /* =========================================================================
-   Contact Roles — Widget Logic (one-line rows, inline editing)
-   Reads the contact's companies with the Deluge function `contact_roles_widget`
-   and adds / edits / deletes rows with `contact_roles_save`.
+   Contact Profile — Widget Logic
+   Tabs (js/tabs.js) + company cards + add/edit window.
+   Reads the contact with the Deluge function `contact_roles_widget`
+   and adds / edits / deletes company rows with `contact_roles_save`.
    ========================================================================= */
 
 (function () {
@@ -9,25 +10,49 @@
 
   var CONFIG = {
     PAGE_SIZE: 50,
+    FILTER_MIN: 6,                        // show the filter box from this many companies
     LOAD_TIMEOUT_MS: 10000,
     DEBUG: false,
-    CAN_EDIT: true,                       // false = read-only (hides +, pencil and bin)
+    CAN_EDIT: true,                       // false = read-only (hides add and edit)
+    SHOW_ADD: true,                       // false = hide the "Add company" button
+    ACCOUNT_TYPE_TONE: {                  // chip colour: good = green, warn = amber, bad = red, anything else = grey
+      "Active": "good",
+      "Will go for renewal": "good",
+      "Renewal In Progress": "good",
+      "Will go for cancellation": "warn",
+      "Cancellation in Progress": "warn",
+      "Pending Transfer to Authority (Warning 1)": "warn",
+      "Pending Transfer to Authority (Warning 2)": "warn",
+      "Pending Transfer to Authority (Management Decision)": "warn",
+      "Send First Warning": "warn",
+      "Send Final Warning": "warn",
+      "Strike-Off": "warn",
+      "Cancelled": "bad",
+      "Expired": "bad",
+      "Transferred to Competitor": "bad",
+      "Transferred to Authority": "bad"
+      // not listed (grey): Non Action License, Prospect, Reseller, TLZ Company, Referral Partner,
+      // In Discussion, Amendment In Progress
+    },
     FUNCTION_NAME: "contact_roles_widget",
     SAVE_FUNCTION_NAME: "contact_roles_save",
     LIST_KEY: "shareholder",
     ACCOUNT_URL: "https://crm.zoho.com/crm/org682300086/tab/Accounts/",
     ACCOUNTS_MODULE: "Accounts",
+    ACCOUNT_TYPE_FIELD: "Account_Type",   // single picklist on the main Account record
+    ACCOUNT_ROLES_FIELD: "Contacts_Roles",   // subform on the Account record
+    PC_FIELD: "PC",                          // primary-contact tick box in that subform
     SEARCH_MIN_CHARS: 2,
     SEARCH_DELAY_MS: 300,
     TOAST_MS: 2600,
     TOAST_ERR_MS: 5000,
-    SIZE_FULL_FALLBACK: { width: "400px", height: "500px" },
+    SIZE_FULL_FALLBACK: { width: "400px", height: "560px" },
     MIN_HEIGHT: "65px",
     ROLE_FIELDS: [
-      { key: "pic", label: "PIC" },
-      { key: "pc", label: "PC" },
-      { key: "shareholder", label: "Shareholder" },
-      { key: "officer", label: "Officer" }
+      { key: "pic", label: "PIC", full: "Person in charge" },
+      { key: "pc", label: "PC", full: "Primary contact" },
+      { key: "shareholder", label: "Shareholder", full: "Owns shares" },
+      { key: "officer", label: "Officer", full: "Company officer" }
     ]
   };
 
@@ -37,12 +62,13 @@
     contactName: "",
     roles: [],
     shown: CONFIG.PAGE_SIZE,
+    filter: "",
     minimized: false,
     fullSize: null,
     edit: null,            // { id, isNew, account, saving, refs }
-    confirm: null,         // { id, busy }
-    clearOnRender: false,  // clear edit/confirm once the refreshed list arrives
-    searchToken: 0
+    clearOnRender: false,  // close the edit window once the refreshed data arrives
+    searchToken: 0,
+    types: {}              // accountId -> Account_Type, fetched by the widget when the loader did not send it
   };
   var searchTimer = null;
   var toastTimer = null;
@@ -54,12 +80,10 @@
     var args = [TAG].concat([].slice.call(arguments));
     try { console.log.apply(console, args); } catch (e) {}
   }
-
   function logErr() {
     var args = [TAG].concat([].slice.call(arguments));
     try { console.error.apply(console, args); } catch (e) {}
   }
-
   function safe(value, max) {
     var s;
     try { s = typeof value === "string" ? value : JSON.stringify(value, null, 2); }
@@ -75,14 +99,12 @@
     return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="' + (sw || 2.2) +
       '" stroke-linecap="round" stroke-linejoin="round">' + inner + "</svg>";
   }
-
   var ICONS = {
     tick: svg('<path d="m5 12.5 4.5 4.5L19 7.5"></path>', 3.2),
-    dash: svg('<path d="M7 12h10"></path>', 3.2),
     x: svg('<path d="M18 6 6 18M6 6l12 12"></path>', 2.8),
-    building: svg('<rect x="5" y="3" width="14" height="18" rx="1.5"></rect><path d="M9 7.5h.01M15 7.5h.01M9 11.5h.01M15 11.5h.01"></path><path d="M10 21v-4h4v4"></path>', 2.4),
     edit: svg('<path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"></path>', 2.3),
-    trash: svg('<path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path><path d="M10 11v6M14 11v6"></path>', 2.3)
+    mail: svg('<rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m3 7 9 6 9-6"></path>', 2.2),
+    phone: svg('<path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 1.9.7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.8.7a2 2 0 0 1 1.7 2Z"></path>', 2.1)
   };
 
   /* ---------------- Elements ---------------- */
@@ -99,10 +121,12 @@
     countBadge: $("countBadge"),
 
     loader: $("loader"), main: $("main-view"), error: $("error-view"),
-    table: $("table"), rows: $("rows"), thead: $("thead"),
-    empty: $("empty"), emptyText: $("emptyText"),
+    rows: $("rows"),
+    empty: $("empty"), emptyTitle: $("emptyTitle"), emptyText: $("emptyText"),
     more: $("more"), moreBtn: $("moreBtn"),
-    addRow: $("addRow"),
+    addRow: $("addRow"), filterWrap: $("filterWrap"), filter: $("coFilter"),
+
+    modal: $("modal"), dialog: $("dialog"),
 
     errorTitle: $("error-title"), errorMessage: $("error-message"),
     debug: $("debug"), copyBtn: $("copyBtn"),
@@ -117,9 +141,7 @@
   function captureFullSize() {
     if (state.fullSize || state.minimized) return;
     var w = window.innerWidth, h = window.innerHeight;
-    if (w > 100 && h > 150) {
-      state.fullSize = { width: w + "px", height: h + "px" };
-    }
+    if (w > 100 && h > 150) state.fullSize = { width: w + "px", height: h + "px" };
     log("full size captured:", safe(state.fullSize));
   }
 
@@ -134,10 +156,8 @@
     clearTimeout(noDataTimer);
     captureFullSize();
     log("PageLoad entity (raw):", safe(entity));
-
     state.contactId = findKey(entity, "contact_id") || findId(entity, "EntityId");
     log("contact_id received by widget:", state.contactId);
-
     load(false);
   });
 
@@ -148,12 +168,18 @@
     b.addEventListener("click", function () { setMinimized(!state.minimized); });
   });
   el.copyBtn.addEventListener("click", copyDebug);
-
-  el.moreBtn.addEventListener("click", function () {
-    state.shown += CONFIG.PAGE_SIZE;
+  el.moreBtn.addEventListener("click", function () { state.shown += CONFIG.PAGE_SIZE; renderList(); });
+  el.addRow.addEventListener("click", startAdd);
+  el.filter.addEventListener("input", function () {
+    state.filter = el.filter.value.trim().toLowerCase();
+    state.shown = CONFIG.PAGE_SIZE;
     renderList();
   });
-  el.addRow.addEventListener("click", startAdd);
+  el.modal.addEventListener("mousedown", function (e) { if (e.target === el.modal) closeModal(); });
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape") return;
+    if (state.edit) closeModal();
+  });
 
   /* ---------------- Minimize / restore ---------------- */
 
@@ -161,13 +187,11 @@
     captureFullSize();
     state.minimized = min;
     el.card.classList.toggle("is-min", min);
-
     Array.prototype.forEach.call(el.minBtns, function (b) {
       var label = min ? "Expand" : "Minimize";
       b.setAttribute("aria-label", label);
       b.setAttribute("title", label);
     });
-
     var full = state.fullSize || CONFIG.SIZE_FULL_FALLBACK;
     resizeFlyout(min
       ? { width: full.width, height: CONFIG.MIN_HEIGHT }
@@ -191,7 +215,7 @@
     return ZOHO.CRM.FUNCTIONS.execute(name, request);
   }
 
-  // Load the list. silent = true keeps the screen as is (used after a save).
+  // silent = true keeps the screen as is (used after a save).
   function load(silent) {
     if (!state.contactId) {
       showError("Missing contact ID",
@@ -199,7 +223,6 @@
         { contactIdInWidget: state.contactId });
       return;
     }
-
     if (!silent) setMode("loading");
 
     callFunction(CONFIG.FUNCTION_NAME, { contact_id: state.contactId })
@@ -215,7 +238,6 @@
       });
   }
 
-  // Run the save function; resolves on success, rejects with an Error on failure.
   function runWrite(args) {
     return callFunction(CONFIG.SAVE_FUNCTION_NAME, args).then(function (res) {
       log("save result:", safe(res));
@@ -231,14 +253,14 @@
     });
   }
 
-  // After a save, the refresh failed: unlock the row and tell the user.
+  // After a save, the refresh failed: unlock everything and tell the user.
   function fail(silent, title, message, debug) {
     if (silent) {
       state.clearOnRender = false;
       state.edit = null;
-      state.confirm = null;
+      hideModal();
       renderList();
-      toast("Saved, but the list couldn't refresh. " + message, "err");
+      toast("Saved, but the data couldn't refresh. " + message, "err");
     } else {
       showError(title, message, debug);
     }
@@ -256,31 +278,27 @@
         { call: ctx, received: raw, stack: e.stack });
       return;
     }
-
     if (!payload) {
       logErr("No payload found in response");
       fail(silent, "Couldn't read the response",
-        "The function responded, but the contact roles payload wasn't found in it.",
+        "The function responded, but the contact payload wasn't found in it.",
         { call: ctx, received: raw });
       return;
     }
-
     if (payload.error) {
-      fail(silent, "Couldn't load roles", payload.message || "Failed to load contact roles.",
+      fail(silent, "Couldn't load profile", payload.message || "Failed to load the contact profile.",
         { call: ctx, received: raw });
       return;
     }
-
     try {
       render(payload, silent);
     } catch (err) {
       logErr("render failed", err);
-      fail(silent, "Couldn't display roles", "Render error: " + err.message,
+      fail(silent, "Couldn't display profile", "Render error: " + err.message,
         { call: ctx, received: raw, payload: payload, stack: err.stack });
     }
   }
 
-  // Searches the response (breadth-first) for the object that has the roles list.
   function extractPayload(root) {
     return bfs(root, function (v) {
       if (v[CONFIG.LIST_KEY] && typeof v[CONFIG.LIST_KEY] === "object") return true;
@@ -289,7 +307,6 @@
     });
   }
 
-  // Finds the save function's {error: true|false, message} object.
   function extractResult(root) {
     return bfs(root, function (v) { return typeof v.error === "boolean"; });
   }
@@ -298,11 +315,9 @@
     var queue = [root];
     var seen = [];
     var steps = 0;
-
     while (queue.length && steps++ < 300) {
       var v = queue.shift();
       if (v === null || v === undefined) continue;
-
       if (typeof v === "string") {
         var parsed = tryParse(v);
         if (parsed !== null) queue.push(parsed);
@@ -310,7 +325,6 @@
       }
       if (typeof v !== "object" || seen.indexOf(v) !== -1) continue;
       seen.push(v);
-
       if (test(v)) return v;
       Object.keys(v).forEach(function (k) { queue.push(v[k]); });
     }
@@ -347,7 +361,7 @@
     return null;
   }
 
-  // Like findKey, but also accepts a value that is an array (Zoho's EntityId can be one).
+  // Like findKey, but also accepts an array value (Zoho's EntityId can be one).
   function findId(root, key) {
     var direct = findKey(root, key);
     if (direct) return direct;
@@ -386,63 +400,92 @@
   function render(payload, keepPaging) {
     if (state.clearOnRender) {
       state.edit = null;
-      state.confirm = null;
       state.clearOnRender = false;
+      hideModal();
     }
 
     state.contactName = (payload.contact && payload.contact.name) || payload.contact_name || "";
     state.roles = normalizeRoles(payload[CONFIG.LIST_KEY]).sort(byPriority);
+    state.roles.forEach(function (r) {
+      if (!r.accountType && state.types[r.accountId]) r.accountType = state.types[r.accountId];
+    });
     if (!keepPaging) state.shown = CONFIG.PAGE_SIZE;
 
-    renderHeader();
-    renderList();
+    ContactTabs.render(payload);   // General / Passport / Emirates ID tabs + RV badge
 
-    setMode("main");
-  }
-
-  function renderHeader() {
-    el.titleText.textContent = "Contact Roles";
+    el.titleText.textContent = "Contact Profile";
     el.contactName.textContent = state.contactName;
     toggle(el.contactWrap, !!state.contactName);
 
-    el.countBadge.innerHTML = "";
-    var label = h("span", "recv__label");
-    label.innerHTML = ICONS.building;
-    label.appendChild(h("span", "", "Companies"));
-    el.countBadge.appendChild(label);
-    el.countBadge.appendChild(h("span", "recv__amt", String(state.roles.length)));
-    toggle(el.countBadge, true);
+    renderList();
+    setMode("main");
+    fillAccountTypes();
   }
 
-  /* ---------------- List ---------------- */
+  // Reads Account_Type straight from each Account record (as the signed-in user) for any company
+  // the loader function didn't send it for. Results are cached for the session.
+  function fillAccountTypes() {
+    var ids = [];
+    state.roles.forEach(function (r) {
+      if (r.accountId && !r.accountType && state.types[r.accountId] === undefined && ids.indexOf(r.accountId) === -1) {
+        ids.push(r.accountId);
+      }
+    });
+    if (!ids.length) return;
+
+    Promise.all(ids.map(function (id) {
+      return ZOHO.CRM.API.getRecord({ Entity: CONFIG.ACCOUNTS_MODULE, RecordID: id })
+        .then(function (res) {
+          var rec = res && res.data && res.data[0];
+          var v = rec ? rec[CONFIG.ACCOUNT_TYPE_FIELD] : "";
+          state.types[id] = cleanType(v && typeof v === "object" ? v.name || v.value : v);
+        })
+        .catch(function (err) {
+          logErr("Account_Type lookup failed for", id, err);
+          state.types[id] = "";
+        });
+    })).then(function () {
+      state.roles.forEach(function (r) {
+        if (!r.accountType && state.types[r.accountId]) r.accountType = state.types[r.accountId];
+      });
+      renderList();
+    });
+  }
+
+  /* ---------------- Company cards ---------------- */
+
+  function matches(r) {
+    if (!state.filter) return true;
+    return (r.accountName + " " + r.accountType + " " + r.email + " " + r.phone).toLowerCase().indexOf(state.filter) !== -1;
+  }
 
   function renderList() {
-    clearTimeout(searchTimer);
-    state.searchToken++;
-
-    var list = state.roles;
+    var all = state.roles;
+    var list = all.filter(matches);
     var visible = list.slice(0, state.shown);
-    var addingNew = !!(state.edit && state.edit.isNew);
 
     el.rows.innerHTML = "";
     visible.forEach(function (r) {
-      if (state.edit && !state.edit.isNew && state.edit.id === r.id) {
-        el.rows.appendChild(buildEditRow(r));
-      } else if (state.confirm && state.confirm.id === r.id) {
-        el.rows.appendChild(buildConfirmRow(r));
-      } else {
-        el.rows.appendChild(buildRow(r));
-      }
+      el.rows.appendChild(buildCard(r));
     });
-    if (addingNew) el.rows.appendChild(buildEditRow(null));
 
-    var hasRows = list.length > 0;
-    toggle(el.thead, hasRows || addingNew);
-    toggle(el.empty, !hasRows && !addingNew);
-    if (!hasRows && !addingNew) {
-      el.emptyText.textContent = CONFIG.CAN_EDIT
-        ? "Use Add company below to link one."
-        : "This contact isn't linked to any company yet.";
+    toggle(el.filterWrap, all.length >= CONFIG.FILTER_MIN);
+    var showAdd = CONFIG.CAN_EDIT && CONFIG.SHOW_ADD;
+    toggle(el.addRow, showAdd);
+    toggle(el.filterWrap.parentNode, showAdd || all.length >= CONFIG.FILTER_MIN);
+
+    var none = list.length === 0;
+    toggle(el.empty, none);
+    if (none) {
+      if (all.length) {
+        el.emptyTitle.textContent = "No matches";
+        el.emptyText.textContent = "Try a different name, email or number.";
+      } else {
+        el.emptyTitle.textContent = "No companies yet";
+        el.emptyText.textContent = CONFIG.CAN_EDIT
+          ? "Use Add company to link one."
+          : "This contact isn't linked to any company yet.";
+      }
     }
 
     var remaining = list.length - visible.length;
@@ -450,77 +493,73 @@
     if (remaining > 0) {
       el.moreBtn.textContent = "Show " + Math.min(CONFIG.PAGE_SIZE, remaining) + " more (" + remaining + " remaining)";
     }
-
-    toggle(el.addRow, CONFIG.CAN_EDIT && !addingNew);
   }
 
-  function buildRow(r) {
-    var row = h("div", "trow grid-cols" + (r.pc ? " is-pc" : ""));
+  function initials(name) {
+    var p = String(name || "?").trim().split(/\s+/);
+    return (p[0].charAt(0) + (p[1] ? p[1].charAt(0) : "")).toUpperCase();
+  }
+  function buildCard(r) {
+    var card = h("div", "co" + (r.pc ? " is-pc" : ""));
 
-    // Account (opens the Account record in a new tab)
-    var acc = h("div", "c-acc");
+    var top = h("div", "co__top");
+    top.appendChild(h("span", "co__av", initials(r.accountName)));
+    var nm;
     if (r.accountId) {
-      var link = h("a", "acc-link", r.accountName || "(No account name)");
-      link.href = CONFIG.ACCOUNT_URL + r.accountId;
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      link.title = r.accountName || "";
-      acc.appendChild(link);
+      nm = h("a", "co__name", r.accountName || "(No account name)");
+      nm.href = CONFIG.ACCOUNT_URL + r.accountId;
+      nm.target = "_blank";
+      nm.rel = "noopener noreferrer";
     } else {
-      acc.appendChild(h("span", "acc-link", r.accountName || "(No account name)"));
+      nm = h("span", "co__name", r.accountName || "(No account name)");
     }
+    nm.title = r.accountName || "";
+    var idBox = h("div", "co__id");
+    idBox.appendChild(nm);
+    if (r.accountType) {
+      var tt = h("span", "type type--" + (CONFIG.ACCOUNT_TYPE_TONE[r.accountType] || "neutral"), r.accountType);
+      tt.title = "Account type: " + r.accountType;
+      idBox.appendChild(tt);
+    }
+    top.appendChild(idBox);
+    if (CONFIG.CAN_EDIT) {
+      var actions = h("div", "co__actions");
+      actions.appendChild(iconBtn("edit", "Edit", "", function () { startEdit(r); }));
+      top.appendChild(actions);
+    }
+    card.appendChild(top);
 
-    // Email
-    var email = h("div", "c-email");
+    var info = h("div", "co__info");
     if (r.email) {
-      var a = h("a", "txt", r.email);
+      var a = h("a", "co__line", r.email);
       a.href = "mailto:" + r.email;
       a.title = r.email;
-      email.appendChild(a);
-    } else {
-      email.appendChild(h("span", "txt txt--empty", "—"));
+      a.insertAdjacentHTML("afterbegin", ICONS.mail);
+      info.appendChild(a);
     }
-
-    // Phone
-    var phone = h("div", "c-phone");
     if (r.phone) {
-      var p = h("a", "txt", r.phone);
+      var p = h("a", "co__line", r.phone);
       p.href = "tel:" + r.phone.replace(/[^\d+]/g, "");
       p.title = r.phone;
-      phone.appendChild(p);
-    } else {
-      phone.appendChild(h("span", "txt txt--empty", "—"));
+      p.insertAdjacentHTML("afterbegin", ICONS.phone);
+      info.appendChild(p);
     }
+    if (!r.email && !r.phone) info.appendChild(h("span", "co__line co__line--empty", "No contact details"));
+    card.appendChild(info);
 
-    row.appendChild(acc);
-    row.appendChild(email);
-    row.appendChild(phone);
-
-    // Roles
-    var group = h("div", "c-role-group");
+    var roles = h("div", "co__roles");
+    var any = false;
     CONFIG.ROLE_FIELDS.forEach(function (f) {
-      var on = !!r[f.key];
-      var cell = h("div", "c-role");
-      var role = h("span", "role role--" + (on ? "on" : "off"));
-      role.setAttribute("title", f.label + ": " + (on ? "Yes" : "No"));
-      role.setAttribute("aria-label", f.label + ": " + (on ? "Yes" : "No"));
-      var ico = h("span", "role__ico");
-      ico.innerHTML = on ? ICONS.tick : ICONS.dash;
-      role.appendChild(ico);
-      cell.appendChild(role);
-      group.appendChild(cell);
+      if (!r[f.key]) return;
+      any = true;
+      var pill = h("span", "pill pill--" + f.key, f.label);
+      pill.title = f.full;
+      roles.appendChild(pill);
     });
-    row.appendChild(group);
+    if (!any) roles.appendChild(h("span", "pill pill--none", "No roles"));
+    card.appendChild(roles);
 
-    // Actions
-    if (CONFIG.CAN_EDIT) {
-      var actions = h("div", "c-actions");
-      actions.appendChild(iconBtn("edit", "Edit", "", function () { startEdit(r); }));
-      actions.appendChild(iconBtn("trash", "Remove", "is-danger", function () { startConfirm(r); }));
-      row.appendChild(actions);
-    }
-
-    return row;
+    return card;
   }
 
   function iconBtn(iconKey, label, extra, onClick) {
@@ -533,15 +572,14 @@
     return b;
   }
 
-  /* ---------------- Inline edit / add ---------------- */
-
   function busy() {
-    return !!((state.edit && state.edit.saving) || (state.confirm && state.confirm.busy));
+    return !!(state.edit && state.edit.saving);
   }
+
+  /* ---------------- Add / edit window ---------------- */
 
   function startEdit(r) {
     if (!CONFIG.CAN_EDIT || busy()) return;
-    state.confirm = null;
     state.edit = {
       id: r.id,
       isNew: false,
@@ -550,45 +588,75 @@
       refs: null
     };
     renderList();
-    if (state.edit && state.edit.refs) {
-      state.edit.refs.row.scrollIntoView({ block: "nearest" });
-      state.edit.refs.email.focus();
-    }
+    openModal(r);
+    state.edit.refs.email.focus();
   }
 
   function startAdd() {
     if (!CONFIG.CAN_EDIT || busy()) return;
-    state.confirm = null;
     state.edit = { id: "", isNew: true, account: null, saving: false, refs: null };
     renderList();
-    if (state.edit && state.edit.refs) {
-      state.edit.refs.row.scrollIntoView({ block: "nearest" });
-      state.edit.refs.acc.focus();
-    }
+    openModal(null);
+    state.edit.refs.acc.focus();
   }
 
-  function cancelEdit() {
+  function hideModal() {
+    clearTimeout(searchTimer);
+    state.searchToken++;
+    toggle(el.modal, false);
+    el.dialog.innerHTML = "";
+  }
+
+  function closeModal() {
     if (!state.edit || state.edit.saving) return;
     state.edit = null;
-    renderList();
+    hideModal();
   }
 
-  function buildEditRow(r) {
-    var ed = state.edit;
-    var row = h("div", "trow grid-cols is-edit");
-    var refs = { row: row, roles: {}, controls: [], results: null, pickFirst: null };
+  function field(labelText) {
+    var f = h("div", "field");
+    f.appendChild(h("label", "field__label", labelText));
+    return f;
+  }
 
-    // Account lookup
-    var acc = h("div", "c-acc");
-    var accInput = h("input", "input" + (ed.account ? " is-picked" : ""));
-    accInput.type = "text";
-    accInput.placeholder = "Search account…";
-    accInput.autocomplete = "off";
-    accInput.setAttribute("aria-label", "Account name");
-    accInput.value = ed.account ? ed.account.name : "";
+  function textInput(placeholder, mode, value) {
+    var i = h("input", "input");
+    i.type = "text";
+    if (mode) i.setAttribute("inputmode", mode);
+    i.placeholder = placeholder;
+    i.autocomplete = "off";
+    i.setAttribute("aria-label", placeholder);
+    i.value = value || "";
+    return i;
+  }
+
+  function openModal(r) {
+    var ed = state.edit;
+    var refs = { roles: {}, controls: [], results: null, pickFirst: null };
+    var dlg = el.dialog;
+    dlg.innerHTML = "";
+
+    // Header
+    var head = h("div", "dlg__head");
+    var ttl = h("div", "dlg__ttl");
+    ttl.appendChild(h("h2", "dlg__title", ed.isNew ? "Add company" : "Edit company"));
+    ttl.appendChild(h("p", "dlg__sub", state.contactName ? "for " + state.contactName : "Link a company to this contact"));
+    head.appendChild(ttl);
+    var closeBtn = iconBtn("x", "Close", "", closeModal);
+    head.appendChild(closeBtn);
+    refs.controls.push(closeBtn);
+    dlg.appendChild(head);
+
+    var body = h("div", "dlg__body");
+
+    // Company lookup
+    var fAcc = field("Company");
+    var accInput = textInput("Search account…", "", ed.account ? ed.account.name : "");
+    if (ed.account) accInput.classList.add("is-picked");
     var results = h("div", "results hidden");
-    acc.appendChild(accInput);
-    acc.appendChild(results);
+    fAcc.appendChild(accInput);
+    fAcc.appendChild(results);
+    body.appendChild(fAcc);
     refs.acc = accInput;
     refs.results = results;
     refs.controls.push(accInput);
@@ -598,9 +666,7 @@
       accInput.classList.remove("is-picked");
       onAccountInput(refs);
     });
-    accInput.addEventListener("blur", function () {
-      setTimeout(function () { hideResults(refs); }, 150);
-    });
+    accInput.addEventListener("blur", function () { setTimeout(function () { hideResults(refs); }, 150); });
     accInput.addEventListener("keydown", function (e) {
       if (e.key !== "Enter") return;
       e.preventDefault();
@@ -608,96 +674,86 @@
       else if (ed.account) submitEdit();
     });
 
-    // Email
-    var email = h("div", "c-email");
-    var emailInput = h("input", "input");
-    emailInput.type = "text";
-    emailInput.setAttribute("inputmode", "email");
-    emailInput.placeholder = "Email address";
-    emailInput.autocomplete = "off";
-    emailInput.setAttribute("aria-label", "Email address");
-    emailInput.value = r ? r.email : "";
-    email.appendChild(emailInput);
-    refs.email = emailInput;
-    refs.controls.push(emailInput);
+    // Email + phone
+    var fEmail = field("Email address");
+    refs.email = textInput("name@company.com", "email", r ? r.email : "");
+    fEmail.appendChild(refs.email);
+    var fPhone = field("Contact number");
+    refs.phone = textInput("+971 …", "tel", r ? r.phone : "");
+    fPhone.appendChild(refs.phone);
+    body.appendChild(fEmail);
+    body.appendChild(fPhone);
+    refs.controls.push(refs.email, refs.phone);
 
-    // Phone
-    var phone = h("div", "c-phone");
-    var phoneInput = h("input", "input");
-    phoneInput.type = "text";
-    phoneInput.setAttribute("inputmode", "tel");
-    phoneInput.placeholder = "Contact number";
-    phoneInput.autocomplete = "off";
-    phoneInput.setAttribute("aria-label", "Contact number");
-    phoneInput.value = r ? r.phone : "";
-    phone.appendChild(phoneInput);
-    refs.phone = phoneInput;
-    refs.controls.push(phoneInput);
-
-    row.appendChild(acc);
-    row.appendChild(email);
-    row.appendChild(phone);
-
-    // Roles (checkboxes)
-    var group = h("div", "c-role-group");
+    // Roles
+    var fRoles = field("Roles");
+    var grid = h("div", "tgs");
     CONFIG.ROLE_FIELDS.forEach(function (f) {
-      var cell = h("div", "c-role");
-      var lab = h("label", "chk");
-      lab.title = f.label;
+      var lab = h("label", "tg tg--" + f.key);
       var inp = document.createElement("input");
       inp.type = "checkbox";
-      inp.setAttribute("aria-label", f.label);
       inp.checked = r ? !!r[f.key] : false;
-      var box = h("span", "chk__box");
-      box.innerHTML = ICONS.tick;
+      var box = h("span", "tg__box");
+      var chk = h("span", "tg__chk");
+      chk.innerHTML = ICONS.tick;
+      var txt = h("span", "tg__txt");
+      txt.appendChild(h("b", "", f.label));
+      txt.appendChild(h("small", "", f.full));
+      box.appendChild(chk);
+      box.appendChild(txt);
       lab.appendChild(inp);
       lab.appendChild(box);
-      cell.appendChild(lab);
-      group.appendChild(cell);
+      grid.appendChild(lab);
       refs.roles[f.key] = inp;
       refs.controls.push(inp);
     });
-    row.appendChild(group);
+    fRoles.appendChild(grid);
+    body.appendChild(fRoles);
 
-    // Actions: save / cancel
-    var actions = h("div", "c-actions");
-    var saveBtn = iconBtn("tick", ed.isNew ? "Add" : "Save", "is-ok", submitEdit);
-    var cancelBtn = iconBtn("x", "Cancel", "", cancelEdit);
-    actions.appendChild(saveBtn);
-    actions.appendChild(cancelBtn);
-    row.appendChild(actions);
-    refs.saveBtn = saveBtn;
-    refs.controls.push(saveBtn, cancelBtn);
+    refs.err = h("div", "dlg__err hidden");
+    body.appendChild(refs.err);
+    dlg.appendChild(body);
 
-    row.addEventListener("keydown", function (e) {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        cancelEdit();
-      } else if (e.key === "Enter" && e.target.tagName === "INPUT" && e.target.type === "text" && e.target !== accInput) {
+    // Footer
+    var foot = h("div", "dlg__foot");
+    var cancel = h("button", "btn btn--ghost btn--lg", "Cancel");
+    cancel.type = "button";
+    cancel.addEventListener("click", closeModal);
+    var save = h("button", "btn btn--primary btn--lg", ed.isNew ? "Add company" : "Save changes");
+    save.type = "button";
+    save.addEventListener("click", submitEdit);
+    foot.appendChild(cancel);
+    foot.appendChild(save);
+    dlg.appendChild(foot);
+    refs.saveBtn = save;
+    refs.controls.push(cancel, save);
+
+    dlg.onkeydown = function (e) {
+      if (e.key === "Enter" && e.target.tagName === "INPUT" && e.target.type === "text" && e.target !== accInput) {
         e.preventDefault();
         submitEdit();
       }
-    });
+    };
 
     ed.refs = refs;
-    if (ed.saving) setEditBusy(true);
-    return row;
+    toggle(el.modal, true);
   }
 
-  // Errors never add a second line: the row turns red and a toast explains why.
   function setRowError(msg) {
     var refs = state.edit && state.edit.refs;
     if (!refs) return;
-    refs.row.classList.toggle("is-invalid", !!msg);
-    if (msg) toast(msg, "err");
+    refs.err.textContent = msg || "";
+    toggle(refs.err, !!msg);
+    if (msg) refs.err.scrollIntoView({ block: "nearest" });
   }
 
   function setEditBusy(on) {
-    var refs = state.edit && state.edit.refs;
+    var ed = state.edit;
+    var refs = ed && ed.refs;
     if (!refs) return;
-    refs.row.classList.toggle("is-saving", on);
+    el.dialog.classList.toggle("is-saving", on);
     refs.controls.forEach(function (c) { c.disabled = on; });
-    refs.saveBtn.innerHTML = on ? '<span class="mini-spin"></span>' : ICONS.tick;
+    refs.saveBtn.textContent = on ? "Saving…" : (ed.isNew ? "Add company" : "Save changes");
   }
 
   /* ---- Account lookup (searches the Accounts module) ---- */
@@ -716,7 +772,6 @@
   function searchAccounts(q, refs) {
     var token = ++state.searchToken;
     showResultsMessage(refs, "Searching…");
-
     ZOHO.CRM.API.searchRecord({
       Entity: CONFIG.ACCOUNTS_MODULE,
       Type: "word",
@@ -751,7 +806,6 @@
       refs.results.appendChild(b);
     });
     toggle(refs.results, true);
-    refs.results.scrollIntoView({ block: "nearest" });
   }
 
   function pickAccount(rec, refs) {
@@ -761,7 +815,7 @@
     refs.acc.value = ed.account.name;
     refs.acc.classList.add("is-picked");
     hideResults(refs);
-    refs.row.classList.remove("is-invalid");
+    setRowError("");
     refs.email.focus();
   }
 
@@ -788,7 +842,7 @@
     setRowError("");
 
     if (!ed.account) {
-      setRowError("Please pick an account from the search results.");
+      setRowError("Please pick a company from the search results.");
       refs.acc.focus();
       return;
     }
@@ -796,7 +850,6 @@
       setRowError("This row has no ID. Make sure the loader function returns the subform row id.");
       return;
     }
-
     var duplicate = state.roles.some(function (r) {
       return r.accountId === ed.account.id && (ed.isNew || r.id !== ed.id);
     });
@@ -804,7 +857,6 @@
       setRowError("This contact is already linked to that company.");
       return;
     }
-
     var email = refs.email.value.trim();
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       setRowError("Please enter a valid email address.");
@@ -828,11 +880,24 @@
     setEditBusy(true);
     var wasNew = ed.isNew;
 
-    runWrite(args)
-      .then(function () {
-        state.clearOnRender = true;
-        toast(wasNew ? "Company added" : "Company updated", "ok");
-        load(true);
+    // Only one primary contact (PC) per company: check the Account's Contacts_Roles first.
+    var guard = args.pc === "true"
+      ? checkPrimaryContact(ed.account)
+      : Promise.resolve(null);
+
+    guard
+      .then(function (conflict) {
+        if (conflict) {
+          ed.saving = false;
+          setEditBusy(false);
+          setRowError(conflict);
+          return null;
+        }
+        return runWrite(args).then(function () {
+          state.clearOnRender = true;
+          toast(wasNew ? "Company added" : "Company updated", "ok");
+          load(true);
+        });
       })
       .catch(function (err) {
         logErr("save failed", err);
@@ -844,89 +909,53 @@
       });
   }
 
-  /* ---------------- Remove (one-line confirmation) ---------------- */
-
-  function startConfirm(r) {
-    if (!CONFIG.CAN_EDIT || busy()) return;
-    state.edit = null;
-    state.confirm = { id: r.id, busy: false };
-    renderList();
-  }
-
-  function cancelConfirm() {
-    if (!state.confirm || state.confirm.busy) return;
-    state.confirm = null;
-    renderList();
-  }
-
-  function buildConfirmRow(r) {
-    var c = state.confirm;
-    var row = h("div", "trow is-confirm");
-
-    var text = h("div", "confirm__text");
-    text.appendChild(document.createTextNode("Remove "));
-    text.appendChild(h("b", "", r.accountName || "this company"));
-    text.appendChild(document.createTextNode(" from this contact?"));
-    row.appendChild(text);
-
-    var btns = h("div", "confirm__btns");
-    var cancel = h("button", "btn btn--ghost", "Cancel");
-    cancel.type = "button";
-    cancel.disabled = c.busy;
-    cancel.addEventListener("click", cancelConfirm);
-    var ok = h("button", "btn btn--danger", c.busy ? "Removing…" : "Remove");
-    ok.type = "button";
-    ok.disabled = c.busy;
-    ok.addEventListener("click", function () { confirmDelete(r); });
-    btns.appendChild(cancel);
-    btns.appendChild(ok);
-    row.appendChild(btns);
-
-    return row;
-  }
-
-  function confirmDelete(r) {
-    var c = state.confirm;
-    if (!c || c.busy) return;
-
-    if (!r.id) {
-      toast("This row has no ID. Make sure the loader function returns the subform row id.", "err");
-      return;
-    }
-
-    c.busy = true;
-    renderList();
-
-    runWrite({
-      contact_id: state.contactId,
-      action: "delete",
-      row_id: r.id,
-      account_id: "",
-      pc_email: "",
-      contact_number: "",
-      pic: "false",
-      pc: "false",
-      shareholder: "false",
-      officer: "false"
-    })
-      .then(function () {
-        state.clearOnRender = true;
-        toast("Company removed", "ok");
-        load(true);
-      })
+  // Resolves with an error message if ANOTHER contact is already the PC of this account, else null.
+  function checkPrimaryContact(account) {
+    return ZOHO.CRM.API.getRecord({ Entity: CONFIG.ACCOUNTS_MODULE, RecordID: account.id })
       .catch(function (err) {
-        logErr("delete failed", err);
-        if (state.confirm === c) {
-          c.busy = false;
-          renderList();
-          toast(errText(err), "err");
-        }
+        logErr("PC check failed", err);
+        throw new Error("Couldn't check this company's primary contact, so nothing was saved. Please try again.");
+      })
+      .then(function (res) {
+        var rec = res && res.data && res.data[0];
+        if (!rec) throw new Error("Couldn't read the company record to check its primary contact. Nothing was saved.");
+        var rows = rec[CONFIG.ACCOUNT_ROLES_FIELD];
+        if (!Array.isArray(rows)) rows = [];
+        var other = null;
+        rows.some(function (row) {
+          if (!row || !isTrue(row[CONFIG.PC_FIELD])) return false;
+          if (rowIsThisContact(row)) return false;
+          other = row;
+          return true;
+        });
+        if (!other) return null;
+        var who = rowContactName(other);
+        return (account.name || "This company") + " already has a primary contact" +
+          (who ? " (" + who + ")" : "") + ", so this can't be saved. Untick PC, or change the existing PC on the company first.";
       });
+  }
+
+  // True when any lookup in the subform row points at the contact we're editing.
+  function rowIsThisContact(row) {
+    return Object.keys(row).some(function (k) {
+      var v = row[k];
+      return v && typeof v === "object" && String(v.id) === String(state.contactId);
+    });
+  }
+
+  function rowContactName(row) {
+    var best = "";
+    Object.keys(row).forEach(function (k) {
+      var v = row[k];
+      if (v && typeof v === "object" && typeof v.name === "string" && v.name) {
+        if (!best || /contact/i.test(k)) best = v.name;
+      }
+    });
+    return best;
   }
 
   /* ---------------- Data shaping ---------------- */
 
-  // Accepts a list, a JSON string, or an object keyed by index/id; always returns a clean list.
   function normalizeRoles(raw) {
     var v = raw;
     if (typeof v === "string") v = tryParse(v);
@@ -944,6 +973,7 @@
           id: n.id ? String(n.id) : "",
           accountId: n.account_id ? String(n.account_id) : "",
           accountName: n.account_name || "",
+          accountType: cleanType(n.account_type || n.Account_Type || n.accountType),
           email: n.pc_email || n.email || "",
           phone: n.contact_number || n.phone || "",
           pic: isTrue(n.pic),
@@ -991,11 +1021,8 @@
       document.body.removeChild(ta);
       done();
     }
-    try {
-      navigator.clipboard.writeText(text).then(done, fallback);
-    } catch (e) {
-      fallback();
-    }
+    try { navigator.clipboard.writeText(text).then(done, fallback); }
+    catch (e) { fallback(); }
   }
 
   function closeWidget() {
@@ -1016,6 +1043,13 @@
 
   function toggle(node, show) {
     if (node) node.classList.toggle("hidden", !show);
+  }
+
+  // Account_Type is a text picklist: ignore booleans / "true" / "false" / "null" so they never show as a value.
+  function cleanType(v) {
+    if (v === true || v === false || v === null || v === undefined) return "";
+    var t = String(v).trim();
+    return /^(true|false|null|undefined)$/i.test(t) ? "" : t;
   }
 
   function isTrue(v) { return v === true || v === "true"; }
