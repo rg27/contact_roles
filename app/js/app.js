@@ -13,8 +13,15 @@
     FILTER_MIN: 6,                        // show the filter box from this many companies
     LOAD_TIMEOUT_MS: 10000,
     DEBUG: false,
-    CAN_EDIT: true,                       // false = read-only (hides add and edit)
+    CAN_EDIT: true,                       // master switch: false = read-only for EVERYONE (hides add and edit)
     SHOW_ADD: true,                       // false = hide the "Add company" button
+    EDIT_PROFILES: [                      // only these CRM profiles can add / edit companies
+      "Administrator",
+      "Operations Manager",
+      "CRS on Licenses",
+      "CRS on Licenses and Residence Visa",
+      "Support Executive"
+    ],
     ACCOUNT_TYPE_TONE: {                  // chip colour: good = green, warn = amber, bad = red, anything else = grey
       "Active": "good",
       "Will go for renewal": "good",
@@ -38,9 +45,11 @@
     SAVE_FUNCTION_NAME: "contact_roles_save",
     LIST_KEY: "shareholder",
     ACCOUNT_URL: "https://crm.zoho.com/crm/org682300086/tab/Accounts/",
+    CONTACT_URL: "https://crm.zoho.com/crm/org682300086/tab/Contacts/",
     ACCOUNTS_MODULE: "Accounts",
     ACCOUNT_TYPE_FIELD: "Account_Type",   // single picklist on the main Account record
     ACCOUNT_ROLES_FIELD: "Contacts_Roles",   // subform on the Account record
+    ROLES_CONTACT_FIELD: "Contact_Name",     // contact lookup inside the Account's Contacts_Roles subform
     PC_FIELD: "PC",                          // primary-contact tick box in that subform
     SEARCH_MIN_CHARS: 2,
     SEARCH_DELAY_MS: 300,
@@ -65,6 +74,7 @@
     filter: "",
     minimized: false,
     fullSize: null,
+    canEdit: false,        // set once the logged-in user's profile is known (deny by default)
     edit: null,            // { id, isNew, account, saving, refs }
     clearOnRender: false,  // close the edit window once the refreshed data arrives
     searchToken: 0,
@@ -72,6 +82,9 @@
   };
   var searchTimer = null;
   var toastTimer = null;
+  var toastHideTimer = null;
+  var pcAlertEl = null;                    // the "primary contact already assigned" popup, when open
+  var pcAlertDismiss = function () {};     // what Okay / Escape does for that popup
 
   /* ---------------- Logging ---------------- */
 
@@ -104,7 +117,8 @@
     x: svg('<path d="M18 6 6 18M6 6l12 12"></path>', 2.8),
     edit: svg('<path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"></path>', 2.3),
     mail: svg('<rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m3 7 9 6 9-6"></path>', 2.2),
-    phone: svg('<path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 1.9.7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.8.7a2 2 0 0 1 1.7 2Z"></path>', 2.1)
+    phone: svg('<path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 1.9.7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.8.7a2 2 0 0 1 1.7 2Z"></path>', 2.1),
+    warn: svg('<path d="M12 3 2.8 19a1.5 1.5 0 0 0 1.3 2.2h15.8a1.5 1.5 0 0 0 1.3-2.2L12 3Z"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path>', 2.2)
   };
 
   /* ---------------- Elements ---------------- */
@@ -134,7 +148,36 @@
     toast: $("toast")
   };
 
-  el.card.classList.toggle("no-edit", !CONFIG.CAN_EDIT);
+  /* ---------------- Permissions ---------------- */
+
+  // True only when the master switch is on AND the user's profile is in EDIT_PROFILES.
+  function canEdit() { return CONFIG.CAN_EDIT && state.canEdit; }
+
+  function applyPermissions() {
+    el.card.classList.toggle("no-edit", !canEdit());
+  }
+
+  function profileAllowed(name) {
+    var n = String(name || "").trim().toLowerCase();
+    return CONFIG.EDIT_PROFILES.some(function (p) { return p.toLowerCase() === n; });
+  }
+
+  // Reads the signed-in user and checks their profile. Any failure = read-only.
+  function resolveUser() {
+    return ZOHO.CRM.CONFIG.getCurrentUser()
+      .then(function (res) {
+        var u = res && res.users && res.users[0];
+        state.canEdit = !!(u && u.profile && profileAllowed(u.profile.name));
+        log("user profile:", u && u.profile && u.profile.name, "-> canEdit:", state.canEdit);
+      })
+      .catch(function (err) {
+        logErr("getCurrentUser failed, defaulting to read-only", err);
+        state.canEdit = false;
+      })
+      .then(applyPermissions);   // runs in both cases
+  }
+
+  applyPermissions();   // read-only until the profile is confirmed
 
   /* ---------------- Boot ---------------- */
 
@@ -158,7 +201,7 @@
     log("PageLoad entity (raw):", safe(entity));
     state.contactId = findKey(entity, "contact_id") || findId(entity, "EntityId");
     log("contact_id received by widget:", state.contactId);
-    load(false);
+    resolveUser().then(function () { load(false); });   // profile first, then data
   });
 
   ZOHO.embeddedApp.init();
@@ -178,6 +221,7 @@
   el.modal.addEventListener("mousedown", function (e) { if (e.target === el.modal) closeModal(); });
   document.addEventListener("keydown", function (e) {
     if (e.key !== "Escape") return;
+    if (pcAlertEl) { e.preventDefault(); pcAlertDismiss(); return; }   // popup first
     if (state.edit) closeModal();
   });
 
@@ -419,6 +463,7 @@
 
     renderList();
     setMode("main");
+    syncTabsHeight();      // keeps the floating search bar right under the tabs
     fillAccountTypes();
   }
 
@@ -470,7 +515,7 @@
     });
 
     toggle(el.filterWrap, all.length >= CONFIG.FILTER_MIN);
-    var showAdd = CONFIG.CAN_EDIT && CONFIG.SHOW_ADD;
+    var showAdd = canEdit() && CONFIG.SHOW_ADD;
     toggle(el.addRow, showAdd);
     toggle(el.filterWrap.parentNode, showAdd || all.length >= CONFIG.FILTER_MIN);
 
@@ -482,7 +527,7 @@
         el.emptyText.textContent = "Try a different name, email or number.";
       } else {
         el.emptyTitle.textContent = "No companies yet";
-        el.emptyText.textContent = CONFIG.CAN_EDIT
+        el.emptyText.textContent = canEdit()
           ? "Use Add company to link one."
           : "This contact isn't linked to any company yet.";
       }
@@ -522,7 +567,7 @@
       idBox.appendChild(tt);
     }
     top.appendChild(idBox);
-    if (CONFIG.CAN_EDIT) {
+    if (canEdit()) {
       var actions = h("div", "co__actions");
       actions.appendChild(iconBtn("edit", "Edit", "", function () { startEdit(r); }));
       top.appendChild(actions);
@@ -579,7 +624,7 @@
   /* ---------------- Add / edit window ---------------- */
 
   function startEdit(r) {
-    if (!CONFIG.CAN_EDIT || busy()) return;
+    if (!canEdit() || busy()) return;
     state.edit = {
       id: r.id,
       isNew: false,
@@ -593,7 +638,7 @@
   }
 
   function startAdd() {
-    if (!CONFIG.CAN_EDIT || busy()) return;
+    if (!canEdit() || busy()) return;
     state.edit = { id: "", isNew: true, account: null, saving: false, refs: null };
     renderList();
     openModal(null);
@@ -603,7 +648,9 @@
   function hideModal() {
     clearTimeout(searchTimer);
     state.searchToken++;
+    closePcAlert();
     toggle(el.modal, false);
+    el.dialog.classList.remove("is-saving");   // never carry the saving look into the next window
     el.dialog.innerHTML = "";
   }
 
@@ -634,6 +681,7 @@
     var ed = state.edit;
     var refs = { roles: {}, controls: [], results: null, pickFirst: null };
     var dlg = el.dialog;
+    dlg.classList.remove("is-saving");
     dlg.innerHTML = "";
 
     // Header
@@ -649,7 +697,7 @@
 
     var body = h("div", "dlg__body");
 
-    // Company lookup
+    // Company lookup (locked when editing an existing row; searchable when adding)
     var fAcc = field("Company");
     var accInput = textInput("Search account…", "", ed.account ? ed.account.name : "");
     if (ed.account) accInput.classList.add("is-picked");
@@ -659,7 +707,13 @@
     body.appendChild(fAcc);
     refs.acc = accInput;
     refs.results = results;
-    refs.controls.push(accInput);
+    if (ed.isNew) {
+      refs.controls.push(accInput);          // only Add mode toggles it during a save
+    } else {
+      accInput.disabled = true;              // Edit mode: company can't be changed
+      accInput.classList.add("is-locked");
+      accInput.title = "The company can't be changed when editing";
+    }
 
     accInput.addEventListener("input", function () {
       ed.account = null;
@@ -837,6 +891,7 @@
   function submitEdit() {
     var ed = state.edit;
     if (!ed || ed.saving || !ed.refs) return;
+    if (!canEdit()) return;   // safety net: never save without permission
     var refs = ed.refs;
 
     setRowError("");
@@ -890,7 +945,7 @@
         if (conflict) {
           ed.saving = false;
           setEditBusy(false);
-          setRowError(conflict);
+          showPcConflict(conflict, ed);   // popup in front, must click Okay
           return null;
         }
         return runWrite(args).then(function () {
@@ -909,7 +964,7 @@
       });
   }
 
-  // Resolves with an error message if ANOTHER contact is already the PC of this account, else null.
+  // Resolves with { account, id, name } if ANOTHER contact is already the PC of this account, else null.
   function checkPrimaryContact(account) {
     return ZOHO.CRM.API.getRecord({ Entity: CONFIG.ACCOUNTS_MODULE, RecordID: account.id })
       .catch(function (err) {
@@ -929,9 +984,8 @@
           return true;
         });
         if (!other) return null;
-        var who = rowContactName(other);
-        return (account.name || "This company") + " already has a primary contact" +
-          (who ? " (" + who + ")" : "") + ", so this can't be saved. Untick PC, or change the existing PC on the company first.";
+        var who = rowContactInfo(other);
+        return { account: account.name || "This company", id: who.id, name: who.name };
       });
   }
 
@@ -943,15 +997,89 @@
     });
   }
 
-  function rowContactName(row) {
-    var best = "";
+  // The contact lookup of a subform row: the configured field first, then any lookup that looks like a contact.
+  function rowContactInfo(row) {
+    var info = { id: "", name: "" };
+    var main = row[CONFIG.ROLES_CONTACT_FIELD];
+    if (main && typeof main === "object") {
+      info.id = main.id ? String(main.id) : "";
+      info.name = main.name || "";
+      if (info.id || info.name) return info;
+    }
     Object.keys(row).forEach(function (k) {
       var v = row[k];
-      if (v && typeof v === "object" && typeof v.name === "string" && v.name) {
-        if (!best || /contact/i.test(k)) best = v.name;
+      if (v && typeof v === "object" && v.id && typeof v.name === "string" && v.name) {
+        if (!info.name || /contact/i.test(k)) {
+          info.id = String(v.id);
+          info.name = v.name;
+        }
       }
     });
-    return best;
+    return info;
+  }
+
+  /* ---- "Primary contact already assigned" popup ---- */
+
+  function closePcAlert() {
+    if (pcAlertEl && pcAlertEl.parentNode) pcAlertEl.parentNode.removeChild(pcAlertEl);
+    pcAlertEl = null;
+  }
+
+  // Popup in front of everything. Okay -> closes it, unticks PC and returns to the Edit window.
+  function showPcConflict(c, ed) {
+    closePcAlert();
+
+    var wrap = h("div", "alert");
+    var box = h("div", "alert__box");
+    box.setAttribute("role", "alertdialog");
+    box.setAttribute("aria-modal", "true");
+
+    var head = h("div", "alert__head");
+    var ico = h("span", "alert__ico");
+    ico.innerHTML = ICONS.warn;
+    head.appendChild(ico);
+    head.appendChild(h("h3", "alert__title", "Primary contact already assigned"));
+    box.appendChild(head);
+
+    var msg = h("p", "alert__msg");
+    msg.appendChild(document.createTextNode((c.account || "This company") + " already has a primary contact"));
+    if (c.name) {
+      msg.appendChild(document.createTextNode(": "));
+      if (c.id) {
+        var a = h("a", "alert__link", c.name);
+        a.href = CONFIG.CONTACT_URL + c.id;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        msg.appendChild(a);
+      } else {
+        msg.appendChild(h("b", "", c.name));
+      }
+    }
+    msg.appendChild(document.createTextNode("."));
+    box.appendChild(msg);
+
+    box.appendChild(h("p", "alert__note",
+      "Only one primary contact is allowed per company. PC will be unticked for you; the other roles stay as you set them."));
+
+    var foot = h("div", "alert__foot");
+    var ok = h("button", "btn btn--primary btn--lg", "Okay");
+    ok.type = "button";
+    foot.appendChild(ok);
+    box.appendChild(foot);
+
+    wrap.appendChild(box);
+    el.card.appendChild(wrap);
+    pcAlertEl = wrap;
+
+    pcAlertDismiss = function () {
+      closePcAlert();
+      if (state.edit === ed && ed.refs) {
+        if (ed.refs.roles.pc) ed.refs.roles.pc.checked = false;
+        if (ed.refs.saveBtn) ed.refs.saveBtn.focus();
+      }
+    };
+    ok.addEventListener("click", pcAlertDismiss);
+    ok.focus();
   }
 
   /* ---------------- Data shaping ---------------- */
@@ -993,12 +1121,28 @@
 
   /* ---------------- Helpers ---------------- */
 
-  function toast(msg, kind) {
+  // Keeps the floating search bar right under the tabs, whatever their height.
+  function syncTabsHeight() {
+    var t = $("tabs");
+    if (t && t.offsetHeight) document.documentElement.style.setProperty("--tabs-h", t.offsetHeight + "px");
+  }
+
+  // msg = text or a DOM node. ms = how long it stays. top = true shows it at the top.
+  function toast(msg, kind, ms, top) {
     clearTimeout(toastTimer);
-    el.toast.textContent = msg;
-    el.toast.className = "toast toast--" + (kind || "ok");
-    toastTimer = setTimeout(function () { toggle(el.toast, false); },
-      kind === "err" ? CONFIG.TOAST_ERR_MS : CONFIG.TOAST_MS);
+    clearTimeout(toastHideTimer);
+    el.toast.textContent = "";
+    if (msg && msg.nodeType) el.toast.appendChild(msg);
+    else el.toast.textContent = msg;
+    el.toast.className = "toast toast--" + (kind || "ok") + (top ? " toast--top" : "");
+    var life = ms || (kind === "err" ? CONFIG.TOAST_ERR_MS : CONFIG.TOAST_MS);
+    toastTimer = setTimeout(function () {
+      el.toast.classList.add("is-out");                       // fade out
+      toastHideTimer = setTimeout(function () {
+        toggle(el.toast, false);
+        el.toast.classList.remove("is-out");
+      }, 350);
+    }, life);
   }
 
   function errText(err) {
